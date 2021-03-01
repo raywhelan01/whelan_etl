@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import re
 
+import sqlalchemy
 from sqlalchemy import create_engine
 import psycopg2
 import time
@@ -16,18 +17,20 @@ from config import db_password
 #file directory
 file_dir = 'C:/Users/raywh/Class/whelan_etl/Data'
 
-#load the datasets
-with open(f'{file_dir}/wikipedia.movies.json', mode='r') as file:
-    wiki_movies_raw = json.load(file)
-
-kaggle_metadata = pd.read_csv(f'{file_dir}/movies_metadata.csv')
-ratings = pd.read_csv(f'{file_dir}/ratings.csv')
+#Postgres database address
+db_string = f"postgres://postgres:{db_password}@127.0.0.1:5432/movie_data"
 
 #Nested method that will load and clean the wiki movie data
+#Method takes the file name as a parameter
+# ASSUMPTION: Wikipedia movies JSON file is in the target directory
 def load_wiki(wiki_data):
     #load the wikipedia data
-    with open(f'{file_dir}/{wiki_data}', mode='r') as file:
-        wiki_movies_raw = json.load(file)
+    try:
+        with open(f'{file_dir}/{wiki_data}', mode='r') as file:
+            wiki_movies_raw = json.load(file)
+    
+    except IOError:
+        print('File not located in target directory')
 
     #Remove non-movie entries
     wiki_movies = [movie for movie in wiki_movies_raw
@@ -83,9 +86,7 @@ def load_wiki(wiki_data):
 
     #Drop duplicate entries
     wiki_movies_df['imdb_id'] = wiki_movies_df['imdb_link'].str.extract(r'(tt\d{7})')
-    print(len(wiki_movies_df))
     wiki_movies_df.drop_duplicates(subset='imdb_id', inplace=True)
-    print(len(wiki_movies_df))
     wiki_movies_df.head()
 
     #Remove unnecessary columns
@@ -187,9 +188,16 @@ def load_wiki(wiki_data):
 
     return wiki_movies_df
 
+#Load and clean the kaggle metadata
+#Method takes the file name as a parameter
+# ASSUMPTION: kaggle metadata csv file is in the target directory
 def load_kaggle(kaggle_data):
     #Import the kaggle data
-    kaggle_metadata = pd.read_csv(f'{file_dir}/movies_metadata.csv')
+    try:
+        kaggle_metadata = pd.read_csv(f'{file_dir}/movies_metadata.csv')
+
+    except IOError:
+        print('File not located in target directory')
 
     #Clean the kaggle metadata
     kaggle_metadata = kaggle_metadata[kaggle_metadata['adult'] == 'False'].drop('adult',axis='columns')
@@ -204,8 +212,14 @@ def load_kaggle(kaggle_data):
     return kaggle_metadata
 
 #Load and clean ratings data
+#Method takes the file name as a parameter
+# ASSUMPTION: ratings csv file is in the target folder
 def load_ratings(ratings_data):
-    ratings = pd.read_csv(f'{file_dir}/{ratings_data}')
+    
+    try:
+        ratings = pd.read_csv(f'{file_dir}/{ratings_data}')
+    except IOError:
+        print('File not located in target directory')
 
     #Clean and transform ratings data
     ratings['timestamp'] = pd.to_datetime(ratings['timestamp'], unit='s')
@@ -215,10 +229,10 @@ def load_ratings(ratings_data):
                     .pivot(index='movieId',columns='rating', values='count')
     rating_counts.columns = ['rating_' + str(col) for col in rating_counts.columns]
 
-    return ratings_counts
+    return rating_counts
 
 
-def merge_tables(wiki, kaggle, ratings)
+def merge_tables(wiki, kaggle, ratings):
     #Merge the tables
     movies_df = pd.merge(wiki, kaggle, on='imdb_id', suffixes=['_wiki','_kaggle'])
 
@@ -265,24 +279,45 @@ def merge_tables(wiki, kaggle, ratings)
 
     return movies_with_ratings_df
 
-# Connecting to Postgres
+#Method to upload our transformed data to Postgres database
+#Method receives the modified movies dataframe and the ratings file name as parameters
+# ASSUMPTION: Both the movies data frame and the ratings csv file have the same number of columns as our target Postgres tables, 42 and 5 respectively
+def to_Postgres(movies, ratings):
+    # Connecting to Postgres
+    engine = create_engine(db_string)
 
-db_string = f"postgres://postgres:{db_password}@127.0.0.1:5432/movie_data"
-engine = create_engine(db_string)
+    # Upload the Movies data
+    try:
+        movies.to_sql(name='movies', con=engine, if_exists='append')
+    except sqlalchemy.exc.ProgrammingError:
+        print('Movies dataframe does not match target table')
+    # Upload the Ratings data
+    rows_imported = 0
+    # get the start_time from time.time()
+    start_time = time.time()
+    
+    try:
+        for data in pd.read_csv(f'{file_dir}/{ratings}', chunksize=1000000):
+            print(f'importing rows {rows_imported} to {rows_imported + len(data)}...', end='')
+            data.to_sql(name='ratings', con=engine, if_exists='append')
+            rows_imported += len(data)
 
-# Upload the Movies data
+            # add elapsed time to final print out
+            print(f'Done. {time.time() - start_time} total seconds elapsed')
+    except IOError:
+        print('File not located in target directory')
+    except sqlalchemy.exc.ProgrammingError:
+        print('Ratings dataframe does not match target table')
 
-movies_df.to_sql(name='movies', con=engine)
+    return
 
-# Upload the Ratings data
+#Call the methods to load our datasets
+wiki_df = load_wiki('wikipedia.movies.json')
+kaggle_df = load_kaggle('movies_metadata.csv')
+ratings_df = load_ratings('ratings.csv')
 
-rows_imported = 0
-# get the start_time from time.time()
-start_time = time.time()
-for data in pd.read_csv(f'{file_dir}ratings.csv', chunksize=1000000):
-    print(f'importing rows {rows_imported} to {rows_imported + len(data)}...', end='')
-    data.to_sql(name='ratings', con=engine, if_exists='append')
-    rows_imported += len(data)
+#Call the method to merge our data
+movies_df = merge_tables(wiki_df, kaggle_df, ratings_df)
 
-    # add elapsed time to final print out
-    print(f'Done. {time.time() - start_time} total seconds elapsed')
+#Call the method to load to Postgres
+to_Postgres(movies_df, 'ratings.csv')
